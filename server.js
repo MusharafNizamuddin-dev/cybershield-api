@@ -19,7 +19,9 @@ const R = process.env.UPSTASH_REDIS_REST_URL, T = process.env.UPSTASH_REDIS_REST
 let dirty = false;
 const redis = async (cmd) => {
   const r = await fetch(R, { method: "POST", headers: { Authorization: "Bearer " + T, "Content-Type": "application/json" }, body: JSON.stringify(cmd) });
-  return (await r.json()).result;
+  const j = await r.json();
+  if (j.error) throw new Error(j.error);
+  return j.result;
 };
 async function load() {
   if (!R || !T) return console.log("Persistence off (memory only)");
@@ -29,12 +31,15 @@ async function load() {
     console.log("Persistence on, loaded", sites.size, "sites");
   } catch (e) { console.log("Load failed:", e.message); }
 }
-setInterval(async () => {
+async function save() {
   if (!R || !T || !dirty) return;
   dirty = false;
-  try { await redis(["SET", "cybershield:sites", JSON.stringify(Object.fromEntries(sites))]); }
+  try { await redis(["SET", "cybershield:sites", JSON.stringify(Object.fromEntries(sites))]); console.log("Saved", sites.size, "sites"); }
   catch (e) { dirty = true; console.log("Save failed:", e.message); }
-}, 10000).unref();
+}
+setInterval(save, 10000).unref();
+// Railway sends SIGTERM on redeploy: save right away so nothing is lost
+process.on("SIGTERM", async () => { await save(); process.exit(0); });
 const rnd = (n) => crypto.randomBytes(n).toString("hex");
 const sha = (v) => crypto.createHash("sha256").update(String(v || "")).digest("hex");
 // keys are stored only as SHA-256 hashes; `given` is the raw key from the request

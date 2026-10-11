@@ -1,0 +1,13 @@
+{
+  "name": "cybershield-backend",
+  "version": "1.0.0",
+  "description": "Live demo backend for CyberShield's Log Analyzer - a fake login endpoint that logs attempts, detects brute-force patterns, and can actually block IPs.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5"
+  }
+}

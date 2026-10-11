@@ -5,14 +5,14 @@ const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
 const path = require("path");
-
+ 
 const app = express();
 app.set("trust proxy", 1);
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || "*" }));
 app.use(express.json({ limit: "10kb" }));
-
+ 
 const sites = new Map();
-
+ 
 // Optional persistence: free Upstash Redis over REST (no extra npm packages).
 // Without UPSTASH_* variables it falls back to memory only (lost on redeploy).
 const R = process.env.UPSTASH_REDIS_REST_URL, T = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -48,7 +48,7 @@ const same = (given, storedHash) => {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 };
 const clamp = (v, lo, hi, d) => { v = Number(v); return Number.isFinite(v) ? Math.min(hi, Math.max(lo, Math.round(v))) : d; };
-
+ 
 // Rate limit this API too
 const buckets = new Map();
 const limit = (max) => (req, res, next) => {
@@ -59,14 +59,14 @@ const limit = (max) => (req, res, next) => {
   next();
 };
 setInterval(() => { const n = Date.now(); for (const [k, b] of buckets) if (b.reset < n) buckets.delete(k); }, 60000).unref();
-
+ 
 function owner(req, res, next) {
   const s = sites.get(req.params.id);
   if (!s) return res.status(404).json({ error: "not_found" });
   if (!same(req.headers["x-owner-key"], s.ownerKey)) return res.status(403).json({ error: "forbidden" });
   req.site = s; next();
 }
-
+ 
 app.post("/api/sites/connect", limit(10), (req, res) => {
   let u;
   try { u = new URL(String((req.body && req.body.url) || "")); } catch (e) { return res.status(400).json({ error: "invalid_url" }); }
@@ -77,12 +77,12 @@ app.post("/api/sites/connect", limit(10), (req, res) => {
   dirty = true;
   res.json({ siteId: id, ownerKey, guardKey, host: u.host });
 });
-
+ 
 app.get("/api/sites/:id/status", limit(60), owner, (req, res) => {
   const s = req.site;
   res.json({ connected: Date.now() - s.lastSeen < 45000, protect: s.protect, max: s.max, windowSec: s.windowSec, allowed: s.allowed, blocked: s.blocked });
 });
-
+ 
 app.post("/api/sites/:id/protect", limit(30), owner, (req, res) => {
   const s = req.site, b = req.body || {};
   s.protect = b.enabled === true;
@@ -91,7 +91,7 @@ app.post("/api/sites/:id/protect", limit(30), owner, (req, res) => {
   dirty = true;
   res.json({ ok: true, protect: s.protect, max: s.max, windowSec: s.windowSec });
 });
-
+ 
 // Called by the guard on the user's server every ~15s (heartbeat + stats + settings)
 app.post("/api/guard/:id/sync", limit(30), (req, res) => {
   const s = sites.get(req.params.id);
@@ -103,8 +103,10 @@ app.post("/api/guard/:id/sync", limit(30), (req, res) => {
   dirty = true;
   res.json({ enabled: s.protect, max: s.max, windowSec: s.windowSec });
 });
-
+ 
 app.get("/cybershield-guard.js", (req, res) => res.type("js").sendFile(path.join(__dirname, "cybershield-guard.js")));
 app.get("/", (req, res) => res.type("text").send("CyberShield API running"));
-
+ 
 load().then(() => app.listen(process.env.PORT || 3000, () => console.log("CyberShield API up")));
+
+                                                                                                          

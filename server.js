@@ -14,7 +14,7 @@ const path = require("path");
 const app = express();
 app.set("trust proxy", 1);
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || "*" }));
-app.use(express.json({ limit: "10kb" }));
+app.use(express.json({ limit: "64kb" }));
  
 const sites = new Map();
  
@@ -39,7 +39,7 @@ async function load() {
 async function save() {
   if (!R || !T || !dirty) return;
   dirty = false;
-  try { await redis(["SET", "cybershield:sites", JSON.stringify(Object.fromEntries(sites))]); console.log("Saved", sites.size, "sites"); }
+  try { await redis(["SET", "cybershield:sites", JSON.stringify(Object.fromEntries([...sites].map(([k, v]) => { const { logs, logSeq, ...rest } = v; if (rest.cf) { const { logBusy, logAt, logFrom, logOk, ...cfRest } = rest.cf; rest.cf = cfRest; } return [k, rest]; })))]); console.log("Saved", sites.size, "sites"); }
   catch (e) { dirty = true; console.log("Save failed:", e.message); }
 }
 setInterval(save, 10000).unref();
@@ -261,6 +261,61 @@ app.post("/api/sites/connect-cloudflare", limit(6), async (req, res) => {
   } catch (e) { cfFail(res, e); }
 });
 
+// ---------------------------------------------------------------- Live logs (for the Log Analyzer)
+// Each site keeps its last 500 requests in memory only (never saved to Redis, never kept after a restart).
+const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const p2 = (n) => String(n).padStart(2, "0");
+function logLine(ts, ip, method, p, status) {
+  const d = new Date(ts);
+  const when = p2(d.getUTCDate()) + "/" + MON[d.getUTCMonth()] + "/" + d.getUTCFullYear() + ":" + p2(d.getUTCHours()) + ":" + p2(d.getUTCMinutes()) + ":" + p2(d.getUTCSeconds()) + " +0000";
+  return String(ip).replace(/^::ffff:/, "") + ' - - [' + when + '] "' + method + " " + p + ' HTTP/1.1" ' + status + " 0";
+}
+function pushLog(s, line) {
+  if (!s.logs) { s.logs = []; s.logSeq = 0; }
+  s.logs.push({ n: ++s.logSeq, l: line });
+  if (s.logs.length > 500) s.logs.shift();
+}
+const cleanTxt = (v, max) => String(v == null ? "" : v).replace(/[^\x21-\x7e]/g, "").slice(0, max);
+// Cloudflare: read the newest requests from Cloudflare analytics (needs the token's Analytics:Read permission).
+// Cloudflare data is a little delayed, so this is "near real time", not instant.
+async function pullCfLogs(s) {
+  if (!s.cf || s.cf.logBusy || Date.now() - (s.cf.logAt || 0) < 8000) return;
+  s.cf.logBusy = true; s.cf.logAt = Date.now();
+  try {
+    const token = decTok(s.cf.tokenEnc), now = new Date();
+    const from = s.cf.logFrom ? new Date(s.cf.logFrom) : new Date(now.getTime() - 5 * 60000);
+    const q = '{viewer{zones(filter:{zoneTag:"' + s.cf.zoneId + '"}){rows:httpRequestsAdaptive(limit:200,orderBy:[datetime_ASC],filter:{datetime_gt:"' + from.toISOString() + '",datetime_lt:"' + now.toISOString() + '"}){datetime clientIP clientRequestHTTPMethodName clientRequestPath edgeResponseStatus}}}}';
+    const r = await fetch(CFAPI + "/graphql", { method: "POST", headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" }, body: JSON.stringify({ query: q }), signal: AbortSignal.timeout(15000) });
+    const j = await r.json();
+    const z = j && j.data && j.data.viewer && j.data.viewer.zones && j.data.viewer.zones[0];
+    if (z && z.rows) {
+      s.cf.logOk = true;
+      let last = s.cf.logFrom || null;
+      for (const x of z.rows) {
+        pushLog(s, logLine(Date.parse(x.datetime), x.clientIP, cleanTxt(x.clientRequestHTTPMethodName, 8) || "GET", cleanTxt(x.clientRequestPath, 200) || "/", clamp(x.edgeResponseStatus, 100, 599, 200)));
+        last = x.datetime;
+      }
+      if (last) s.cf.logFrom = last;
+    } else s.cf.logOk = false;
+  } catch (e) { s.cf.logOk = false; }
+  s.cf.logBusy = false;
+}
+app.get("/api/sites/:id/logs", limit(60), owner, async (req, res) => {
+  const s = req.site, since = clamp(req.query.since, 0, 1e12, 0);
+  if (s.mode === "cloudflare") await pullCfLogs(s);
+  const all = s.logs || [];
+  // if the app is behind (or the server restarted), restart from the oldest line we still have
+  const rows = all.filter((x) => x.n > since).slice(-300);
+  res.json({
+    connected: s.mode === "cloudflare" ? true : Date.now() - s.lastSeen < 45000,
+    mode: s.mode === "cloudflare" ? "cloudflare" : "guard",
+    host: s.host,
+    seq: s.logSeq || 0,
+    lines: rows.map((x) => x.l),
+    note: s.mode === "cloudflare" && s.cf.logOk === false ? "cloudflare_logs_unavailable" : null
+  });
+});
+
 // Disconnect: removes our Cloudflare rule (best effort), then forgets the site and the token
 app.delete("/api/sites/:id", limit(20), owner, async (req, res) => {
   const s = req.site;
@@ -280,6 +335,10 @@ app.post("/api/guard/:id/sync", limit(30), (req, res) => {
   s.lastSeen = Date.now();
   s.allowed += clamp(b.allowed, 0, 1e9, 0);
   s.blocked += clamp(b.blocked, 0, 1e9, 0);
+  if (Array.isArray(b.events)) for (const e of b.events.slice(0, 100)) {
+    if (!e || typeof e !== "object") continue;
+    pushLog(s, logLine(clamp(e.t, 0, 4e12, Date.now()), cleanTxt(e.ip, 60) || "Unknown", cleanTxt(e.m, 8) || "GET", cleanTxt(e.p, 200) || "/", clamp(e.s, 100, 599, 200)));
+  }
   dirty = true;
   res.json({ enabled: s.protect, max: s.max, windowSec: s.windowSec });
 });
